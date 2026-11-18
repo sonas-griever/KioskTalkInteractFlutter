@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "835526073052",
+    "project_id": "kiosk-talk-interact-flutter",
+    "storage_bucket": "kiosk-talk-interact-flutter.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:835526073052:android:b7cef367ea490ac08fb219",
+        "android_client_info": {
+          "package_name": "com.sonas.kiosktalk.kiosk_talk"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAjHCQ2EaRgSxvQQkS3B8b9yFwoh5Vyn-c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
