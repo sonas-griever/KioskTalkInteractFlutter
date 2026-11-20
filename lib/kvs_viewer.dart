@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -9,12 +10,15 @@ import 'models.dart';
 import 'sigv4.dart';
 
 class KvsViewer {
-  final screenView = RTCVideoRenderer();
-  final cameraView = RTCVideoRenderer();
+  RTCVideoRenderer screenView = RTCVideoRenderer();
+  RTCVideoRenderer cameraView = RTCVideoRenderer();
+  var screenFrame = false;
+  var cameraFrame = false;
   RTCPeerConnection? _peer;
   RTCDataChannel? control;
   RTCDataChannel? _remoteControl;
   WebSocketChannel? _socket;
+  StreamSubscription<dynamic>? _signalSub;
   MediaStream? _local;
   final List<MediaStream> _remoteStreams = [];
   final List<RTCIceCandidate> _pendingIce = [];
@@ -25,25 +29,54 @@ class KvsViewer {
   var _videoCount = 0;
   var _remoteReady = false;
   var _viewsReady = false;
+  var _socketOpen = false;
+  var _socketGen = 0;
+  var _reconnects = 0;
+  var _reconnecting = false;
+  var recovering = false;
+  Timer? _reconnectTimer;
   var closed = false;
+  var speaker = false;
 
   int get videoWidth => screenView.videoWidth;
   int get videoHeight => screenView.videoHeight;
   int get videoRotation => screenView.value.rotation;
+  bool? get screenLandscape => _landscape(videoWidth, videoHeight, videoRotation);
+  bool? get cameraLandscape => _landscape(cameraView.videoWidth, cameraView.videoHeight, cameraView.value.rotation);
+
+  bool? _landscape(int width, int height, int rotation) {
+    var wide = width;
+    var tall = height;
+    if (rotation == 90 || rotation == 270) {
+      final swap = wide;
+      wide = tall;
+      tall = swap;
+    }
+    if (wide <= 0 || tall <= 0) return null;
+    return wide > tall;
+  }
   bool get hasScreen => screenView.srcObject != null;
   bool get hasCamera => cameraView.srcObject != null;
   bool get controlOpen => _openChannel()?.state == RTCDataChannelState.RTCDataChannelOpen;
 
+  void holdPicture() {
+    screenFrame = false;
+    cameraFrame = false;
+  }
+
+  void _blank(RTCVideoRenderer view) {
+    if (view.textureId == null) return;
+    view.srcObject = null;
+  }
+
   Future<void> connect(ViewerTicket ticket, void Function() onChanged) async {
-    if (!_viewsReady) {
-      await screenView.initialize();
-      await cameraView.initialize();
-      screenView.onResize = onChanged;
-      _viewsReady = true;
-    }
     closed = false;
     _ticket = ticket;
     _onChanged = onChanged;
+    holdPicture();
+    onChanged();
+    await _freshViews();
+    if (closed) return;
     await Helper.setAndroidAudioConfiguration(AndroidAudioConfiguration(
       manageAudioFocus: true,
       androidAudioMode: AndroidAudioMode.inCommunication,
@@ -52,8 +85,36 @@ class KvsViewer {
       androidAudioAttributesUsageType: AndroidAudioAttributesUsageType.voiceCommunication,
       androidAudioAttributesContentType: AndroidAudioAttributesContentType.speech,
     ));
-    await Helper.setSpeakerphoneOn(true);
+    await Helper.setSpeakerphoneOn(speaker);
     _local = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+    await _listen(ticket);
+    await _offer(2);
+  }
+
+  Future<void> replaceTicket(ViewerTicket ticket) async {
+    if (closed) return;
+    _ticket = ticket;
+    final peer = _peer;
+    if (peer != null) {
+      try {
+        await peer.setConfiguration({
+          'iceServers': ticket.iceServers,
+          'sdpSemantics': 'unified-plan',
+          'bundlePolicy': 'max-bundle',
+        });
+      } catch (error) {
+        debugPrint('kvs ice config $error');
+      }
+    }
+    if (!_socketOpen) await _reconnect();
+  }
+
+  Future<void> _listen(ViewerTicket ticket) async {
+    final generation = ++_socketGen;
+    await _signalSub?.cancel();
+    _signalSub = null;
+    _socketOpen = false;
+    await _socket?.sink.close();
     final url = signKvsWebSocket(
       wssEndpoint: ticket.wssEndpoint,
       channelArn: ticket.channelArn,
@@ -64,15 +125,56 @@ class KvsViewer {
       region: ticket.region,
     );
     _socket = WebSocketChannel.connect(Uri.parse(url));
-    _socket!.stream.listen((message) => _onSignal(ticket.clientId, '$message'), onError: (error) {
+    _signalSub = _socket!.stream.listen((message) => _onSignal(ticket.clientId, '$message'), onError: (error) {
       debugPrint('kvs socket $error');
+      if (generation != _socketGen || closed) return;
+      _socketOpen = false;
+      _scheduleReconnect(1);
+    }, onDone: () {
+      if (generation != _socketGen || closed) return;
+      _socketOpen = false;
+      _scheduleReconnect(1);
     }, cancelOnError: true);
     try {
       await _socket!.ready;
+      if (generation == _socketGen && !closed) _socketOpen = true;
     } catch (error) {
       debugPrint('kvs socket ready $error');
+      _socketOpen = false;
     }
-    await _offer(2);
+  }
+
+  void _scheduleReconnect(int seconds) {
+    if (closed || _reconnects >= 6) return;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(Duration(seconds: seconds), () {
+      unawaited(_reconnect());
+    });
+  }
+
+  Future<void> _reconnect() async {
+    final ticket = _ticket;
+    if (closed || _reconnecting || ticket == null || _reconnects >= 6) return;
+    _reconnecting = true;
+    _reconnects++;
+    _setRecovering(true);
+    try {
+      await _listen(ticket);
+      if (closed) return;
+      if (!_socketOpen) {
+        _scheduleReconnect(2);
+        return;
+      }
+      await _offer(2);
+    } finally {
+      _reconnecting = false;
+    }
+  }
+
+  void _setRecovering(bool value) {
+    if (recovering == value) return;
+    recovering = value;
+    _onChanged?.call();
   }
 
   Future<void> _offer(int videos) async {
@@ -117,7 +219,10 @@ class KvsViewer {
       if (generation != _generation) return;
       unawaited(_showTrack(event, onChanged));
     };
-    _peer!.onIceConnectionState = (state) => debugPrint('kvs ice $state');
+    _peer!.onIceConnectionState = (state) {
+      if (generation != _generation) return;
+      _onIce(state);
+    };
     _peer!.onIceCandidate = (candidate) {
       if (generation != _generation || candidate.candidate == null || candidate.candidate!.isEmpty) return;
       _sendIce(ticket.clientId, candidate);
@@ -127,6 +232,11 @@ class KvsViewer {
     debugPrint('kvs offer videos=$videos');
     await _peer!.setLocalDescription(offer);
     _send('SDP_OFFER', ticket.clientId, '', {'type': 'offer', 'sdp': offer.sdp});
+  }
+
+  Future<void> setSpeaker(bool on) async {
+    speaker = on;
+    await Helper.setSpeakerphoneOn(on);
   }
 
   void setMuted(bool muted) {
@@ -158,10 +268,31 @@ class KvsViewer {
     return control ?? _remoteControl;
   }
 
+  void _onIce(RTCIceConnectionState state) {
+    debugPrint('kvs ice $state');
+    if (state == RTCIceConnectionState.RTCIceConnectionStateConnected || state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+      _reconnectTimer?.cancel();
+      _reconnects = 0;
+      _setRecovering(false);
+      return;
+    }
+    if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+      _scheduleReconnect(2);
+    } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+      _scheduleReconnect(3);
+    }
+  }
+
   Future<void> close() async {
     if (closed) return;
     closed = true;
+    speaker = false;
     _generation++;
+    _socketGen++;
+    _reconnectTimer?.cancel();
+    _setRecovering(false);
+    await _signalSub?.cancel();
+    _signalSub = null;
     await _socket?.sink.close();
     _socket = null;
     await control?.close();
@@ -174,10 +305,61 @@ class KvsViewer {
     }
     await _local?.dispose();
     _local = null;
-    screenView.srcObject = null;
-    cameraView.srcObject = null;
+    holdPicture();
+    _onChanged?.call();
+    _blank(screenView);
+    _blank(cameraView);
     _videos.clear();
     _remoteStreams.clear();
+  }
+
+  Future<void> _freshViews() async {
+    final previousScreen = _viewsReady ? screenView : null;
+    final previousCamera = _viewsReady ? cameraView : null;
+    await SchedulerBinding.instance.endOfFrame;
+    if (closed) return;
+    final nextScreen = RTCVideoRenderer();
+    final nextCamera = RTCVideoRenderer();
+    await nextScreen.initialize();
+    await nextCamera.initialize();
+    if (closed) {
+      await nextScreen.dispose();
+      await nextCamera.dispose();
+      return;
+    }
+    _arm(nextScreen, true);
+    _arm(nextCamera, false);
+    screenView = nextScreen;
+    cameraView = nextCamera;
+    _viewsReady = true;
+    _onChanged?.call();
+    if (previousScreen != null) {
+      previousScreen.srcObject = null;
+      await previousScreen.dispose();
+    }
+    if (previousCamera != null) {
+      previousCamera.srcObject = null;
+      await previousCamera.dispose();
+    }
+  }
+
+  void _arm(RTCVideoRenderer view, bool screen) {
+    view.onResize = () {
+      if (view.videoWidth > 0 && view.videoHeight > 0) _shown(view, screen);
+      _onChanged?.call();
+    };
+    view.onFirstFrameRendered = () => _shown(view, screen);
+  }
+
+  void _shown(RTCVideoRenderer view, bool screen) {
+    if (screen) {
+      if (view != screenView || screenFrame) return;
+      screenFrame = true;
+    } else {
+      if (view != cameraView || cameraFrame) return;
+      cameraFrame = true;
+    }
+    _onChanged?.call();
   }
 
   Future<void> _showTrack(RTCTrackEvent event, void Function() onChanged) async {
@@ -185,7 +367,7 @@ class KvsViewer {
     if (track.kind == 'audio') {
       track.enabled = true;
       await Helper.setVolume(1, track);
-      await Helper.setSpeakerphoneOn(true);
+      await Helper.setSpeakerphoneOn(speaker);
       debugPrint('kvs audio ${track.id}');
     } else if (track.kind == 'video') {
       final id = track.id ?? '';

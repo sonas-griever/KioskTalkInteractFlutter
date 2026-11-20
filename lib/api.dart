@@ -42,12 +42,35 @@ class TalkApi {
     return next;
   }
 
-  Future<Map<String, bool>> machineLinks(String hotelId, List<String> codes) async {
-    if (codes.isEmpty) return const {};
+  Future<StaffSession> refresh(StaffSession current) async {
+    final body = await _send('POST', '/talk-refresh');
+    final token = body['token'];
+    if (token is! String || token.isEmpty) return current;
+    final hotels = body['hotels'] is List
+        ? (body['hotels'] as List).whereType<Map>().map((item) => Hotel.fromJson(Map<String, dynamic>.from(item))).where((hotel) => hotel.id.isNotEmpty).toList()
+        : current.hotels;
+    return StaffSession(token: token, account: current.account, hotels: hotels.isEmpty ? current.hotels : hotels);
+  }
+
+  Future<({Map<String, bool> links, Set<String> registered})> machineLinks(String hotelId, List<String> codes) async {
+    if (codes.isEmpty) return (links: const <String, bool>{}, registered: const <String>{});
     final body = await _send('POST', '/hotels/$hotelId/machine-links', payload: {'machines': codes});
-    final links = body['links'];
-    if (links is! Map) return const {};
-    return links.map((key, value) => MapEntry('$key', value == 'on'));
+    final rawLinks = body['links'];
+    final channels = body['channels'];
+    final links = <String, bool>{};
+    if (rawLinks is Map) {
+      for (final entry in rawLinks.entries) {
+        links['${entry.key}'] = entry.value == 'on';
+      }
+    }
+    final registered = <String>{};
+    if (channels is Map) {
+      for (final entry in channels.entries) {
+        final value = entry.value;
+        if (value == true || value == 1 || value == 'true') registered.add('${entry.key}');
+      }
+    }
+    return (links: links, registered: registered);
   }
 
   Future<List<Machine>> machines(String hotelId) async {
@@ -65,11 +88,14 @@ class TalkApi {
     await _send('DELETE', '/devices', payload: {'token': token});
   }
 
-  Future<List<CallLog>> calls() async {
-    final body = await _send('GET', '/calls');
+  Future<({List<CallLog> calls, bool more})> calls({int? before}) async {
+    final path = before == null ? '/calls' : '/calls?before=$before';
+    final body = await _send('GET', path);
     final rows = body['calls'];
-    if (rows is! List) return const [];
-    return rows.whereType<Map>().map((item) => CallLog.fromJson(Map<String, dynamic>.from(item))).toList();
+    final calls = rows is List
+        ? rows.whereType<Map>().map((item) => CallLog.fromJson(Map<String, dynamic>.from(item))).toList()
+        : <CallLog>[];
+    return (calls: calls, more: body['more'] == true);
   }
 
   Future<CallNotice> startCall(String hotelId, String machineCode) async {
@@ -83,7 +109,19 @@ class TalkApi {
   }
 
   Future<void> reject(String merchantNo) async {
-    await _send('POST', '/calls/$merchantNo/reject');
+    Object? last;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        await _send('POST', '/calls/$merchantNo/reject');
+        return;
+      } catch (error) {
+        last = error;
+        if (error is ApiException && (error.status == 401 || error.status == 403)) rethrow;
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+      }
+    }
+    if (last is ApiException) throw last;
+    throw ApiException('拒接沒有送到');
   }
 
   Future<void> hangup(String merchantNo) async {

@@ -1,0 +1,18 @@
+name: incoming_ring
+description: Keeps vibrating while a kiosk call is ringing.
+publish_to: none
+
+environment:
+  sdk: ^3.12.2
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.sonas.kiosktalk.incoming_ring
+        pluginClass: IncomingRingPlugin

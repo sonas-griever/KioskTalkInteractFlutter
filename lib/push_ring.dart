@@ -7,8 +7,10 @@ import 'package:flutter_callkit_incoming/entities/android_params.dart';
 import 'package:flutter_callkit_incoming/entities/call_event.dart';
 import 'package:flutter_callkit_incoming/entities/call_kit_params.dart';
 import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
+import 'package:incoming_ring/incoming_ring.dart';
 
 import 'models.dart';
+import 'session_store.dart';
 
 typedef PushHandler = Future<void> Function(CallNotice notice);
 typedef TokenHandler = Future<void> Function(String platform, String token);
@@ -24,6 +26,7 @@ void closeRing(String callId) {
 
 Future<void> dismissRing(String callId) async {
   closeRing(callId);
+  await IncomingRing.stop();
   if (callId.isEmpty) return;
   await FlutterCallkitIncoming.hideCallkitIncoming(CallKitParams(id: callId));
 }
@@ -31,8 +34,7 @@ Future<void> dismissRing(String callId) async {
 CallNotice _fill(CallNotice notice) {
   final latest = _latestIncoming;
   if (latest == null) return notice;
-  final same = notice.callId.isEmpty || notice.callId == latest.callId;
-  if (!same && notice.merchantNo.isNotEmpty) return notice;
+  if (notice.callId.isNotEmpty && latest.callId.isNotEmpty && notice.callId != latest.callId) return notice;
   return CallNotice(
     event: notice.event,
     callId: notice.callId.isEmpty ? latest.callId : notice.callId,
@@ -113,13 +115,24 @@ Future<void> firebaseBackgroundRing(RemoteMessage message) async {
 Future<void> _showFromRemote(RemoteMessage message) async {
   final notice = CallNotice.fromMap(message.data);
   final here = WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
-  if (here && notice.event == 'incoming') {
+    if (here && notice.event == 'incoming') {
     _latestIncoming = notice;
     if (_closedRings.contains(notice.callId)) return;
     if (_onNotice != null) await _onNotice!(notice);
     return;
   }
   await showIncoming(message.data);
+}
+
+Future<String> _hotelName(String hotelId) async {
+  if (hotelId.isEmpty) return '';
+  try {
+    final session = await readSession();
+    for (final hotel in session?.hotels ?? const <Hotel>[]) {
+      if (hotel.id == hotelId && hotel.name.isNotEmpty) return hotel.name;
+    }
+  } catch (_) {}
+  return '';
 }
 
 Future<void> showIncoming(Map<String, dynamic> data) async {
@@ -129,11 +142,13 @@ Future<void> showIncoming(Map<String, dynamic> data) async {
     _latestIncoming = notice;
     if (_closedRings.contains(notice.callId) || _shownRings.contains(notice.callId)) return;
     _shownRings.add(notice.callId);
+    final hotel = await _hotelName(notice.hotelId);
+    final caller = hotel.isEmpty ? notice.label : (notice.label.isEmpty ? hotel : '$hotel　${notice.label}');
     await FlutterCallkitIncoming.showCallkitIncoming(CallKitParams(
       id: notice.callId,
-      nameCaller: notice.label,
+      nameCaller: caller,
       appName: '櫃台通話',
-      handle: notice.machineCode,
+      handle: notice.merchantNo,
       type: 1,
       duration: 30000,
       textAccept: '接聽',
@@ -146,8 +161,14 @@ Future<void> showIncoming(Map<String, dynamic> data) async {
         'machineCode': notice.machineCode,
         'machineName': notice.machineName,
       },
-      android: const AndroidParams(isCustomNotification: true, isShowFullLockedScreen: true, isImportant: true),
+      android: const AndroidParams(
+        isCustomNotification: true,
+        isShowFullLockedScreen: true,
+        isImportant: true,
+        ringtonePath: 'silent',
+      ),
     ));
+    await IncomingRing.start(tone: true);
     return;
   }
   if (notice.event == 'dismiss' || notice.event == 'rejected' || notice.event == 'cancelled') {

@@ -60,7 +60,9 @@ class CallLog {
     required this.machineName,
     required this.direction,
     required this.status,
+    required this.callerName,
     required this.answeredName,
+    required this.endedName,
     required this.duration,
     required this.createdAt,
   });
@@ -71,9 +73,17 @@ class CallLog {
   final String machineName;
   final String direction;
   final String status;
+  final String callerName;
   final String answeredName;
+  final String endedName;
   final int duration;
   final int createdAt;
+
+  bool get unanswered {
+    if (direction != 'in' || (status != 'cancelled' && status != 'rejected')) return false;
+    final name = (status == 'rejected' ? endedName : answeredName).trim();
+    return name.isEmpty || name == '機台' || name == machineName || name == machineCode;
+  }
 
   String get label => machineName.isEmpty ? machineCode : machineName;
 
@@ -85,7 +95,9 @@ class CallLog {
       machineName: '${json['machineName'] ?? ''}',
       direction: '${json['direction'] ?? ''}',
       status: '${json['status'] ?? ''}',
+      callerName: '${json['callerName'] ?? ''}'.trim(),
       answeredName: '${json['answeredName'] ?? ''}'.trim(),
+      endedName: '${json['endedName'] ?? ''}'.trim(),
       duration: json['duration'] is int ? json['duration'] as int : int.tryParse('${json['duration']}') ?? 0,
       createdAt: json['createdAt'] is int ? json['createdAt'] as int : int.tryParse('${json['createdAt']}') ?? 0,
     );
@@ -152,13 +164,16 @@ class CallNotice {
 
   factory CallNotice.fromMap(Map<dynamic, dynamic> raw) {
     final extra = raw['extra'];
-    final source = extra is Map ? {...raw, ...extra} : raw;
+    final source = extra is Map ? {...raw, ...Map<dynamic, dynamic>.from(extra)} : raw;
+    final handle = '${source['handle'] ?? source['number'] ?? ''}'.trim();
+    final merchantNo = '${source['merchantNo'] ?? ''}'.trim().isNotEmpty ? '${source['merchantNo'] ?? ''}'.trim() : handle;
+    final machineCode = '${source['machineCode'] ?? ''}'.trim();
     return CallNotice(
       event: '${source['event'] ?? ''}',
       callId: '${source['callId'] ?? source['id'] ?? ''}',
-      merchantNo: '${source['merchantNo'] ?? ''}',
+      merchantNo: merchantNo,
       hotelId: '${source['hotelId'] ?? ''}',
-      machineCode: '${source['machineCode'] ?? source['handle'] ?? ''}',
+      machineCode: machineCode.isNotEmpty ? machineCode : (handle == merchantNo ? '' : handle),
       machineName: '${source['machineName'] ?? source['nameCaller'] ?? ''}',
       reason: '${source['reason'] ?? ''}',
     );
